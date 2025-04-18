@@ -1,0 +1,63 @@
+Codebase Explanation
+
+Overview:
+- Freqtrade is an open-source Python framework and command-line trading bot for cryptocurrency markets.
+- Provides backtesting, strategy development, hyper-parameter optimization, and live trading via multiple exchanges.
+
+Project Structure:
+- Top-level files:
+  - README.md         : Project overview, installation, and quickstart.
+  - LICENSE           : Apache 2.0 license.
+  - pyproject.toml    : Build and dependency configuration (PEP 517/518).
+  - requirements*.txt : Optional dependency sets (dev, plotting, FreqAI, etc.).
+  - Dockerfile(s)     : Container images for various setups.
+  - mkdocs.yml        : Documentation site configuration.
+- build_helpers/:       Scripts for packaging, schema extraction, and other build tasks.
+- config_examples/:     Example JSON configurations for different exchanges and setups.
+- docker/:              Dockerfiles and compose files for specialized environments (FreqAI, RL, Jupyter, plotting).
+- docs/:                User and developer documentation (Markdown), powered by MkDocs.
+- freqtrade/:           Core Python package:
+    - commands/         : CLI command implementations (backtesting, hyperopt, trade, webserver, etc.).
+    - configuration/    : Loading, validation, and environment detection for config files.
+    - exchange/         : Exchange adapters and CCXT integration.
+    - data/             : Data download, conversion, and analysis modules.
+    - optimize/         : Backtesting and hyper-parameter optimization tools.
+    - freqai/           : Machine learning and reinforcement learning models (LightGBM, XGBoost, PyTorch, RL envs).
+    - persistence/      : Database models and migration logic.
+    - plot/             : Plotting utilities for trade analysis and performance charts.
+    - rpc/              : REST/WebSocket API server, telegram/discord bots for live control.
+    - plugins/          : Modular extensions: pairlists and protection strategies.
+    - util/             : Shared helpers, logging, time utilities, template rendering.
+- ft_client/:           Standalone Python client for remote control of a running Freqtrade bot via RPC.
+- scripts/:             Examples of REST and WebSocket clients.
+- tests/:               Pytest-based test suite covering all modules and integrations.
+- user_data/:           Default directory structure for storing downloaded data, backtest results, logs, and model artifacts.
+
+Key Features:
+- Multi-exchange support via CCXT.
+- Strategy development with customizable indicators and templates.
+- Historical data backtesting with lookahead bias control and reporting.
+- Hyperopt-driven parameter tuning and custom loss functions.
+- Optional machine learning workflows (FreqAI) including supervised models and reinforcement learning.
+- Live trading with order management, stop-loss, leverage, and protections.
+- REST and WebSocket API for remote control and monitoring.
+- Docker-based deployment and Jupyter notebook support.
+
+Dependencies and Tools:
+- Python 3.8+ and standard libraries.
+- pandas, numpy, TA-Lib for technical analysis.
+- ccxt for exchange connectivity.
+- scikit-learn, lightgbm, xgboost, catboost, PyTorch for ML.
+- MkDocs and Markdown for documentation.
+- Pytest for testing.
+
+Usage Summary:
+- Install via pip ("pip install freqtrade") or use provided Docker images.
+- Generate a new user directory: "freqtrade new-config".
+- Download historical data: "freqtrade download-data".
+- Develop or select a strategy and run backtesting: "freqtrade backtesting".
+- Optimize parameters: "freqtrade hyperopt".
+- Start live trading: "freqtrade trade" or via Docker/Kubernetes.
+- Use the REST/WebSocket API or ft_client for remote control.
+
+For detailed usage and advanced topics, refer to the docs/ directory or the online documentation.
