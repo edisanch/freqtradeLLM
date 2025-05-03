@@ -47,9 +47,10 @@ def get_trades_from_db():
     """Extract trades from SQLite database"""
     conn = sqlite3.connect(DB_FILE)
     query = """
-    SELECT pair, profit_ratio, open_date, close_date, trade_duration,
+    SELECT pair, close_profit as profit_ratio, open_date, close_date, 
+           CAST((julianday(close_date) - julianday(open_date)) * 1440 AS INTEGER) as trade_duration,
            open_rate, close_rate, stake_amount, max_rate, min_rate,
-           exit_reason, strategy, tag
+           exit_reason, strategy, enter_tag as tag
     FROM trades
     WHERE close_date IS NOT NULL
     ORDER BY close_date DESC
@@ -242,19 +243,49 @@ def generate_position_size_recommendations(pair_metrics, base_position_size=0.05
     if pair_metrics.empty:
         return pd.DataFrame()
     
-    # Calculate position size based on expectancy
-    recommendations = pair_metrics[['pair', 'expectancy', 'win_rate', 'avg_profit', 'profit_std']].copy()
+    # Calculate position size based on multiple factors
+    recommendations = pair_metrics[['pair', 'expectancy', 'win_rate', 'avg_profit', 'profit_std', 'total_profit', 'trade_count']].copy()
+    
+    # Add absolute profit to consider actual dollar impact
+    # This ensures pairs with large absolute losses get properly penalized
+    recommendations['abs_profit'] = recommendations['total_profit'].abs()
+    max_abs_profit = recommendations['abs_profit'].max()
     
     # Normalize expectancy (min-max scaling)
     min_exp = recommendations['expectancy'].min()
     max_exp = recommendations['expectancy'].max()
     
     if max_exp == min_exp:  # Avoid division by zero
+        recommendations['expectancy_factor'] = 1.0
+    else:
+        recommendations['expectancy_factor'] = (recommendations['expectancy'] - min_exp) / (max_exp - min_exp)
+        
+    # Calculate profitability factor based on both expectancy and total profit
+    recommendations['profitability_score'] = recommendations.apply(
+        lambda row: calculate_profitability_score(
+            row['expectancy_factor'], 
+            row['total_profit'], 
+            row['trade_count'],
+            max_abs_profit
+        ), 
+        axis=1
+    )
+    
+    # Scale between 0.5 and 1.5 (adjusted from original range)
+    min_score = recommendations['profitability_score'].min()
+    max_score = recommendations['profitability_score'].max()
+    
+    if max_score == min_score:
         recommendations['position_factor'] = 1.0
     else:
-        recommendations['position_factor'] = (recommendations['expectancy'] - min_exp) / (max_exp - min_exp)
-        # Scale between 0.5 and 1.5
-        recommendations['position_factor'] = 0.5 + recommendations['position_factor']
+        recommendations['position_factor'] = 0.5 + (recommendations['profitability_score'] - min_score) / (max_score - min_score)
+    
+    # Special handling for high-volume poorly performing pairs
+    # If a pair has significant negative total profit and many trades, limit its factor
+    recommendations['position_factor'] = recommendations.apply(
+        lambda row: min(row['position_factor'], 0.7) if (row['total_profit'] < -10.0 and row['trade_count'] > 10) else row['position_factor'],
+        axis=1
+    )
     
     # Calculate position size
     recommendations['recommended_position'] = base_position_size * recommendations['position_factor']
@@ -265,7 +296,35 @@ def generate_position_size_recommendations(pair_metrics, base_position_size=0.05
         volatility_factor = 1 - (recommendations['profit_std'] / recommendations['profit_std'].max() * 0.5)
         recommendations['recommended_position'] *= volatility_factor
     
-    return recommendations[['pair', 'recommended_position', 'position_factor']]
+    return recommendations[['pair', 'recommended_position', 'position_factor', 'total_profit', 'trade_count']]
+
+def calculate_profitability_score(expectancy_factor, total_profit, trade_count, max_abs_profit):
+    """
+    Calculate a comprehensive profitability score that considers:
+    - Expectancy (win rate * avg win - loss rate * avg loss)
+    - Total profit/loss in absolute dollars
+    - Number of trades (statistical significance)
+    
+    Returns a score that penalizes pairs with large absolute losses and high trade counts
+    """
+    # Base score from expectancy factor (0-1 range)
+    base_score = expectancy_factor
+    
+    # Weight for the total profit component - pairs with significant total profit/loss should be weighted more
+    profit_significance = min(1.0, trade_count / 10)  # Maxes out at 10 trades
+    
+    # Calculate profit factor - negative impact increases with more trades and larger losses
+    profit_factor = 0
+    if total_profit < 0:
+        # For losing pairs, create stronger penalty based on loss amount and trade count
+        loss_severity = abs(total_profit) / max_abs_profit if max_abs_profit > 0 else 0
+        profit_factor = -loss_severity * profit_significance
+    else:
+        # For winning pairs, boost based on profit and trade count
+        profit_factor = (total_profit / max_abs_profit) * profit_significance if max_abs_profit > 0 else 0
+    
+    # Combine factors - expectancy gets 60% weight, actual profit gets 40% weight
+    return base_score * 0.6 + profit_factor * 0.4
 
 def generate_risk_report(trades):
     """Generate comprehensive risk report"""
