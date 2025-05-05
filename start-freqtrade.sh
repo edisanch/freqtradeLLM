@@ -14,6 +14,7 @@ fi
 
 # Start freqtrade with the environment variables
 docker-compose down
+docker compose build
 docker-compose up -d
 
 echo "Freqtrade started with strategy: $STRATEGY"

@@ -1,7 +1,11 @@
 ---
 services:
   freqtrade:
-    image: freqtradeorg/freqtrade:stable
+    # Build from local Dockerfile instead of using the freqtradeorg/freqtrade:stable image
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # image: freqtradeorg/freqtrade:stable  # Commented out pre-built image
     # image: freqtradeorg/freqtrade:develop
     # Use plotting image
     # image: freqtradeorg/freqtrade:develop_plot
