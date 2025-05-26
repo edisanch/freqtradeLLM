@@ -22,8 +22,6 @@ services:
       - "./user_data:/freqtrade/user_data"
       - "./config.json:/freqtrade/config.json"
       - "./tradesv3.dryrun.sqlite:/freqtrade/tradesv3.dryrun.sqlite"
-      - "./tradesv3.dryrun.sqlite-shm:/freqtrade/tradesv3.dryrun.sqlite-shm"
-      - "./tradesv3.dryrun.sqlite-wal:/freqtrade/tradesv3.dryrun.sqlite-wal"
     # Expose only web UI port since we had an issue with 8080
     ports:
       - "8081:8081"
