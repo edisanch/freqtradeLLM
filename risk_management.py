@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-FreqTrade Risk Management Script
-This script analyzes trading performance and provides risk management insights
-Run weekly to reassess strategy performance and make data-driven adjustments
+Enhanced FreqTrade Risk Management Script
+This script analyzes trading performance with adaptive 30-day rolling analysis
+and provides intelligent risk management insights with trend detection.
+Run daily/weekly to reassess strategy performance and make data-driven adjustments
 """
 import json
 import os
 import sqlite3
+import argparse
 from datetime import datetime, timedelta
 
 import matplotlib.pyplot as plt
@@ -43,9 +45,52 @@ def send_telegram_message(message):
         return response.json()
     return None
 
-def get_trades_from_db():
-    """Extract trades from SQLite database"""
+def get_trades_from_db(days_back=None):
+    """Extract trades from SQLite database with optional date filtering"""
     conn = sqlite3.connect(DB_FILE)
+    
+    if days_back:
+        # Calculate date threshold
+        cutoff_date = datetime.now() - timedelta(days=days_back)
+        cutoff_str = cutoff_date.strftime('%Y-%m-%d %H:%M:%S')
+        
+        query = """
+        SELECT pair, close_profit as profit_ratio, open_date, close_date, 
+               CAST((julianday(close_date) - julianday(open_date)) * 1440 AS INTEGER) as trade_duration,
+               open_rate, close_rate, stake_amount, max_rate, min_rate,
+               exit_reason, strategy, enter_tag as tag
+        FROM trades
+        WHERE close_date IS NOT NULL
+        AND close_date >= ?
+        ORDER BY close_date DESC
+        """
+        trades = pd.read_sql_query(query, conn, params=(cutoff_str,))
+    else:
+        # Get all trades
+        query = """
+        SELECT pair, close_profit as profit_ratio, open_date, close_date, 
+               CAST((julianday(close_date) - julianday(open_date)) * 1440 AS INTEGER) as trade_duration,
+               open_rate, close_rate, stake_amount, max_rate, min_rate,
+               exit_reason, strategy, enter_tag as tag
+        FROM trades
+        WHERE close_date IS NOT NULL
+        ORDER BY close_date DESC
+        """
+        trades = pd.read_sql_query(query, conn)
+    
+    conn.close()
+    return trades
+
+def get_trades_between_dates(start_days_back, end_days_back):
+    """Get trades between specific date ranges"""
+    conn = sqlite3.connect(DB_FILE)
+    
+    start_date = datetime.now() - timedelta(days=start_days_back)
+    end_date = datetime.now() - timedelta(days=end_days_back)
+    
+    start_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
+    end_str = end_date.strftime('%Y-%m-%d %H:%M:%S')
+    
     query = """
     SELECT pair, close_profit as profit_ratio, open_date, close_date, 
            CAST((julianday(close_date) - julianday(open_date)) * 1440 AS INTEGER) as trade_duration,
@@ -53,14 +98,32 @@ def get_trades_from_db():
            exit_reason, strategy, enter_tag as tag
     FROM trades
     WHERE close_date IS NOT NULL
+    AND close_date >= ? AND close_date < ?
     ORDER BY close_date DESC
     """
-    trades = pd.read_sql_query(query, conn)
+    
+    trades = pd.read_sql_query(query, conn, params=(end_str, start_str))
     conn.close()
     return trades
 
 def calculate_metrics(trades):
     """Calculate key performance metrics"""
+    if trades.empty:
+        return {
+            'total_trades': 0,
+            'win_count': 0,
+            'loss_count': 0,
+            'win_rate': 0,
+            'profit_sum': 0,
+            'average_profit': 0,
+            'max_drawdown': 0,
+            'profit_factor': 0,
+            'sharpe_ratio': 0,
+            'expectancy': 0,
+            'avg_trade_duration': 0,
+            'trades_per_day': 0
+        }
+    
     metrics = {}
     
     # Basic metrics
@@ -189,336 +252,380 @@ def calculate_pair_expectancy(trades, pair):
     
     return (avg_win * win_rate) + (avg_loss * loss_rate)
 
-def analyze_by_tag(trades):
-    """Analyze performance by strategy tag"""
-    if trades.empty or 'tag' not in trades.columns:
-        return pd.DataFrame()
-        
-    # Filter only trades with tags
-    tagged_trades = trades.dropna(subset=['tag'])
+def calculate_factor_from_metrics(metrics_row):
+    """
+    Convert pair metrics to a position sizing factor
+    Considers expectancy, win rate, trade volume, and total profit impact
+    """
+    expectancy = metrics_row['expectancy']
+    win_rate = metrics_row['win_rate']
+    trade_count = metrics_row['trade_count']
+    total_profit = metrics_row['total_profit']
     
-    if tagged_trades.empty:
-        return pd.DataFrame()
-        
-    tag_metrics = tagged_trades.groupby('tag').agg({
-        'profit_ratio': ['count', 'mean', 'sum'],
-        'trade_duration': 'mean'
-    }).reset_index()
-    
-    tag_metrics.columns = ['tag', 'trade_count', 'avg_profit', 'total_profit', 'avg_duration']
-    
-    # Calculate win rate per tag
-    win_counts = tagged_trades[tagged_trades['profit_ratio'] > 0].groupby('tag').size()
-    tag_metrics['win_count'] = tag_metrics['tag'].map(win_counts).fillna(0).astype(int)
-    tag_metrics['win_rate'] = tag_metrics['win_count'] / tag_metrics['trade_count']
-    
-    return tag_metrics.sort_values('total_profit', ascending=False)
-
-def analyze_recent_performance(trades):
-    """Analyze recent performance vs historical"""
-    if trades.empty:
-        return {}
-        
-    trades['close_date'] = pd.to_datetime(trades['close_date'])
-    
-    # Define time periods
-    now = datetime.now()
-    week_ago = now - timedelta(days=7)
-    month_ago = now - timedelta(days=30)
-    
-    recent_week = trades[trades['close_date'] > week_ago]
-    recent_month = trades[trades['close_date'] > month_ago]
-    older_trades = trades[trades['close_date'] <= month_ago]
-    
-    metrics = {
-        'recent_week': calculate_metrics(recent_week) if not recent_week.empty else None,
-        'recent_month': calculate_metrics(recent_month) if not recent_month.empty else None,
-        'historical': calculate_metrics(older_trades) if not older_trades.empty else None
-    }
-    
-    return metrics
-
-def generate_position_size_recommendations(pair_metrics, base_position_size=0.05):
-    """Generate position sizing recommendations based on pair performance"""
-    if pair_metrics.empty:
-        return pd.DataFrame()
-    
-    # Calculate position size based on multiple factors
-    recommendations = pair_metrics[['pair', 'expectancy', 'win_rate', 'avg_profit', 'profit_std', 'total_profit', 'trade_count']].copy()
-    
-    # Add absolute profit to consider actual dollar impact
-    # This ensures pairs with large absolute losses get properly penalized
-    recommendations['abs_profit'] = recommendations['total_profit'].abs()
-    max_abs_profit = recommendations['abs_profit'].max()
-    
-    # Normalize expectancy (min-max scaling)
-    min_exp = recommendations['expectancy'].min()
-    max_exp = recommendations['expectancy'].max()
-    
-    if max_exp == min_exp:  # Avoid division by zero
-        recommendations['expectancy_factor'] = 1.0
+    # Base factor from expectancy (primary driver)
+    if expectancy > 0:
+        base_factor = 1.0 + min(expectancy * 8, 0.5)  # Cap positive adjustment at 0.5
     else:
-        recommendations['expectancy_factor'] = (recommendations['expectancy'] - min_exp) / (max_exp - min_exp)
-        
-    # Calculate profitability factor based on both expectancy and total profit
-    recommendations['profitability_score'] = recommendations.apply(
-        lambda row: calculate_profitability_score(
-            row['expectancy_factor'], 
-            row['total_profit'], 
-            row['trade_count'],
-            max_abs_profit
-        ), 
-        axis=1
+        base_factor = 1.0 + max(expectancy * 4, -0.5)  # Cap negative adjustment at -0.5
+    
+    # Adjust for win rate (secondary factor)
+    win_rate_adjustment = (win_rate - 0.5) * 0.3  # ±0.15 max adjustment
+    
+    # Statistical confidence (more trades = more reliable)
+    confidence_factor = min(1.0, trade_count / 15)  # Max confidence at 15+ trades
+    
+    # Total profit impact (considers dollar impact)
+    profit_adjustment = 0
+    if abs(total_profit) > 0.03:  # Only if significant profit/loss (3%+)
+        if total_profit > 0:
+            profit_adjustment = min(total_profit * 1.5, 0.3)  # Cap positive at 0.3
+        else:
+            profit_adjustment = max(total_profit * 2, -0.4)   # Cap negative at -0.4
+    
+    # Combine factors with weights
+    final_factor = (
+        base_factor + 
+        (win_rate_adjustment * confidence_factor) + 
+        (profit_adjustment * confidence_factor)
     )
     
-    # Scale between 0.5 and 1.5 (adjusted from original range)
-    min_score = recommendations['profitability_score'].min()
-    max_score = recommendations['profitability_score'].max()
-    
-    if max_score == min_score:
-        recommendations['position_factor'] = 1.0
-    else:
-        recommendations['position_factor'] = 0.5 + (recommendations['profitability_score'] - min_score) / (max_score - min_score)
-    
-    # Special handling for high-volume poorly performing pairs
-    # If a pair has significant negative total profit and many trades, limit its factor
-    recommendations['position_factor'] = recommendations.apply(
-        lambda row: min(row['position_factor'], 0.7) if (row['total_profit'] < -10.0 and row['trade_count'] > 10) else row['position_factor'],
-        axis=1
-    )
-    
-    # Calculate position size
-    recommendations['recommended_position'] = base_position_size * recommendations['position_factor']
-    
-    # Add risk adjustment based on volatility (profit_std)
-    # Higher volatility = lower position size
-    if recommendations['profit_std'].max() > 0:
-        volatility_factor = 1 - (recommendations['profit_std'] / recommendations['profit_std'].max() * 0.5)
-        recommendations['recommended_position'] *= volatility_factor
-    
-    return recommendations[['pair', 'recommended_position', 'position_factor', 'total_profit', 'trade_count']]
+    return final_factor
 
-def calculate_profitability_score(expectancy_factor, total_profit, trade_count, max_abs_profit):
-    """
-    Calculate a comprehensive profitability score that considers:
-    - Expectancy (win rate * avg win - loss rate * avg loss)
-    - Total profit/loss in absolute dollars
-    - Number of trades (statistical significance)
+def analyze_performance_trends(weekly_metrics, monthly_metrics, quarterly_metrics):
+    """Analyze if strategy performance is improving, declining, or stable"""
+    trends = {}
     
-    Returns a score that penalizes pairs with large absolute losses and high trade counts
-    """
-    # Base score from expectancy factor (0-1 range)
-    base_score = expectancy_factor
+    # Skip if any metrics are None or have no trades
+    if not all([weekly_metrics, monthly_metrics, quarterly_metrics]):
+        return {
+            'win_rate': 'insufficient_data',
+            'profit': 'insufficient_data', 
+            'overall': 'insufficient_data'
+        }
     
-    # Weight for the total profit component - pairs with significant total profit/loss should be weighted more
-    profit_significance = min(1.0, trade_count / 10)  # Maxes out at 10 trades
+    if any(m['total_trades'] == 0 for m in [weekly_metrics, monthly_metrics, quarterly_metrics]):
+        return {
+            'win_rate': 'insufficient_data',
+            'profit': 'insufficient_data',
+            'overall': 'insufficient_data'
+        }
     
-    # Calculate profit factor - negative impact increases with more trades and larger losses
-    profit_factor = 0
-    if total_profit < 0:
-        # For losing pairs, create stronger penalty based on loss amount and trade count
-        loss_severity = abs(total_profit) / max_abs_profit if max_abs_profit > 0 else 0
-        profit_factor = -loss_severity * profit_significance
+    # Win rate trend
+    if weekly_metrics['win_rate'] > monthly_metrics['win_rate'] > quarterly_metrics['win_rate']:
+        trends['win_rate'] = 'improving'
+    elif weekly_metrics['win_rate'] < monthly_metrics['win_rate'] < quarterly_metrics['win_rate']:
+        trends['win_rate'] = 'declining'
     else:
-        # For winning pairs, boost based on profit and trade count
-        profit_factor = (total_profit / max_abs_profit) * profit_significance if max_abs_profit > 0 else 0
+        trends['win_rate'] = 'stable'
     
-    # Combine factors - expectancy gets 60% weight, actual profit gets 40% weight
-    return base_score * 0.6 + profit_factor * 0.4
+    # Profit trend (normalized by time period)
+    weekly_daily_profit = weekly_metrics['profit_sum'] / 7
+    monthly_daily_profit = monthly_metrics['profit_sum'] / 30
+    quarterly_daily_profit = quarterly_metrics['profit_sum'] / 90
+    
+    if weekly_daily_profit > monthly_daily_profit > quarterly_daily_profit:
+        trends['profit'] = 'improving'
+    elif weekly_daily_profit < monthly_daily_profit < quarterly_daily_profit:
+        trends['profit'] = 'declining'
+    else:
+        trends['profit'] = 'stable'
+    
+    # Expectancy trend
+    if weekly_metrics['expectancy'] > monthly_metrics['expectancy'] > quarterly_metrics['expectancy']:
+        trends['expectancy'] = 'improving'
+    elif weekly_metrics['expectancy'] < monthly_metrics['expectancy'] < quarterly_metrics['expectancy']:
+        trends['expectancy'] = 'declining'
+    else:
+        trends['expectancy'] = 'stable'
+    
+    # Overall strategy health
+    improving_count = sum(1 for trend in [trends['win_rate'], trends['profit'], trends['expectancy']] if trend == 'improving')
+    declining_count = sum(1 for trend in [trends['win_rate'], trends['profit'], trends['expectancy']] if trend == 'declining')
+    
+    if improving_count >= 2:
+        trends['overall'] = 'strong_uptrend'
+    elif declining_count >= 2:
+        trends['overall'] = 'concerning_downtrend'
+    else:
+        trends['overall'] = 'mixed_signals'
+    
+    return trends
 
-def generate_risk_report(trades):
-    """Generate comprehensive risk report"""
-    report_date = datetime.now().strftime("%Y-%m-%d")
+def apply_trend_adjustments(factors, trends):
+    """Apply macro adjustments based on overall strategy trends"""
+    if trends['overall'] == 'insufficient_data':
+        return factors
     
-    # Calculate overall metrics
-    overall_metrics = calculate_metrics(trades)
+    adjustment_factor = 1.0
     
-    # Analyze by pair
-    pair_metrics = analyze_by_pair(trades)
+    if trends['overall'] == 'strong_uptrend':
+        adjustment_factor = 1.05  # Slightly more aggressive (5% increase)
+    elif trends['overall'] == 'concerning_downtrend':
+        adjustment_factor = 0.90  # More conservative (10% decrease)
     
-    # Analyze by tag
-    tag_metrics = analyze_by_tag(trades)
+    # Apply adjustment to all factors
+    adjusted_factors = {pair: factor * adjustment_factor 
+                       for pair, factor in factors.items()}
     
-    # Recent performance
-    time_comparison = analyze_recent_performance(trades)
+    return adjusted_factors
+
+def generate_adaptive_pair_factors(monthly_trades, min_trades_threshold=5):
+    """
+    Generate pair factors with adaptive logic:
+    - Recent 30-day performance gets 70% weight
+    - Historical performance gets 30% weight (for stability)
+    - Minimum trade threshold to avoid overfitting
+    """
     
-    # Generate position sizing recommendations
-    position_recommendations = generate_position_size_recommendations(pair_metrics)
+    # Get historical trades (31-90 days back for comparison)
+    historical_trades = get_trades_between_dates(90, 31)
     
-    # Create report
-    report = {
-        'report_date': report_date,
-        'overall_metrics': overall_metrics,
-        'pair_metrics': pair_metrics.to_dict(orient='records') if not pair_metrics.empty else [],
-        'tag_metrics': tag_metrics.to_dict(orient='records') if not tag_metrics.empty else [],
-        'time_comparison': time_comparison,
-        'position_recommendations': position_recommendations.to_dict(orient='records') if not position_recommendations.empty else []
-    }
+    # Calculate recent and historical performance
+    recent_metrics = analyze_by_pair(monthly_trades)
+    historical_metrics = analyze_by_pair(historical_trades)
     
-    # Save report
-    report_path = os.path.join(OUTPUT_DIR, f"risk_report_{report_date}.json")
-    with open(report_path, 'w') as f:
-        json.dump(report, f, indent=4, default=str)
+    # Combine with weighted average
+    pair_factors = {}
     
-    # Save pair factors to be loaded by the strategy
-    if not position_recommendations.empty:
-        # Convert to a simple dictionary format for the strategy
-        pair_factors = {}
-        for _, row in position_recommendations.iterrows():
-            # Normalize factors around 1.0
-            # Use position_factor as it's already normalized in a good range (0.5 to 1.5)
-            pair_factors[row['pair']] = float(row['position_factor'])
+    # Get all unique pairs from both datasets
+    all_pairs = set()
+    if not recent_metrics.empty:
+        all_pairs.update(recent_metrics['pair'].unique())
+    if not historical_metrics.empty:
+        all_pairs.update(historical_metrics['pair'].unique())
+    
+    for pair in all_pairs:
+        recent_data = recent_metrics[recent_metrics['pair'] == pair]
+        historical_data = historical_metrics[historical_metrics['pair'] == pair]
         
-        # Save factors to a file that can be loaded by the strategy
+        has_recent = not recent_data.empty and recent_data.iloc[0]['trade_count'] >= min_trades_threshold
+        has_historical = not historical_data.empty and historical_data.iloc[0]['trade_count'] >= min_trades_threshold
+        
+        if has_recent and has_historical:
+            # Both available - use weighted combination
+            recent_factor = calculate_factor_from_metrics(recent_data.iloc[0])
+            historical_factor = calculate_factor_from_metrics(historical_data.iloc[0])
+            
+            # 70% recent, 30% historical
+            factor = (recent_factor * 0.7) + (historical_factor * 0.3)
+            
+        elif has_recent:
+            # Only recent data available
+            factor = calculate_factor_from_metrics(recent_data.iloc[0])
+            
+        elif has_historical:
+            # Only historical data available
+            factor = calculate_factor_from_metrics(historical_data.iloc[0])
+            
+        else:
+            # Not enough data for either - use neutral
+            factor = 1.0
+        
+        # Apply bounds (0.3 to 2.0)
+        factor = max(0.3, min(2.0, factor))
+        pair_factors[pair] = factor
+    
+    return pair_factors
+
+def enhanced_risk_management_workflow(mode='adaptive'):
+    """
+    Enhanced workflow that considers different time horizons
+    """
+    print(f"🔄 Starting Enhanced Risk Management Analysis (mode: {mode})...")
+    
+    if mode == 'adaptive':
+        # 1. Get different time horizons
+        recent_trades = get_trades_from_db(days_back=7)    # Last week
+        monthly_trades = get_trades_from_db(days_back=30)  # Last month
+        quarterly_trades = get_trades_from_db(days_back=90) # Last quarter
+        
+        print(f"📊 Data loaded: {len(recent_trades)} weekly, {len(monthly_trades)} monthly, {len(quarterly_trades)} quarterly trades")
+        
+        # 2. Generate adaptive factors
+        adaptive_factors = generate_adaptive_pair_factors(monthly_trades)
+        
+        # 3. Performance trend analysis
+        weekly_metrics = calculate_metrics(recent_trades)
+        monthly_metrics = calculate_metrics(monthly_trades)
+        quarterly_metrics = calculate_metrics(quarterly_trades)
+        
+        # 4. Detect performance trends
+        trends = analyze_performance_trends(weekly_metrics, monthly_metrics, quarterly_metrics)
+        
+        # 5. Apply trend-based adjustments
+        final_factors = apply_trend_adjustments(adaptive_factors, trends)
+        
+        # 6. Save enhanced factors
+        save_enhanced_factors(final_factors, trends, monthly_metrics)
+        
+        return final_factors, trends, {
+            'weekly': weekly_metrics,
+            'monthly': monthly_metrics,
+            'quarterly': quarterly_metrics
+        }
+    
+    else:
+        # Traditional mode - use all historical data
+        all_trades = get_trades_from_db()
+        pair_metrics = analyze_by_pair(all_trades)
+        
+        if pair_metrics.empty:
+            factors = {}
+        else:
+            factors = {}
+            for _, row in pair_metrics.iterrows():
+                factor = calculate_factor_from_metrics(row)
+                factor = max(0.3, min(2.0, factor))  # Apply bounds
+                factors[row['pair']] = factor
+        
+        # Save simple factors
         factors_path = '/home/stivi/freqtradeLLM/user_data/pair_factors.json'
         with open(factors_path, 'w') as f:
-            json.dump(pair_factors, f, indent=4)
-        print(f"Pair factors saved to {factors_path}")
-    
-    return report, report_path
+            json.dump(factors, f, indent=4)
+        
+        return factors, {}, {'overall': calculate_metrics(all_trades)}
 
-def create_visualizations(trades, report, output_dir):
-    """Create visualizations for the risk report"""
-    if trades.empty:
-        return
+def save_enhanced_factors(factors, trends, monthly_metrics):
+    """Save factors with metadata about trends and timestamp"""
+    timestamp = datetime.now().isoformat()
+    
+    # Enhanced factor file with metadata
+    enhanced_data = {
+        'timestamp': timestamp,
+        'analysis_period_days': 30,
+        'trend_analysis': trends,
+        'monthly_performance': monthly_metrics,
+        'pair_factors': factors,
+        'metadata': {
+            'total_pairs': len(factors),
+            'avg_factor': sum(factors.values()) / len(factors) if factors else 1.0,
+            'max_factor': max(factors.values()) if factors else 1.0,
+            'min_factor': min(factors.values()) if factors else 1.0,
+            'aggressive_pairs': sum(1 for f in factors.values() if f > 1.2),
+            'conservative_pairs': sum(1 for f in factors.values() if f < 0.8)
+        }
+    }
+    
+    # Save enhanced version
+    enhanced_path = '/home/stivi/freqtradeLLM/user_data/enhanced_pair_factors.json'
+    with open(enhanced_path, 'w') as f:
+        json.dump(enhanced_data, f, indent=4)
+    
+    # Save simple version for strategy compatibility
+    simple_path = '/home/stivi/freqtradeLLM/user_data/pair_factors.json'
+    with open(simple_path, 'w') as f:
+        json.dump(factors, f, indent=4)
+    
+    print(f"✅ Enhanced factors saved to {enhanced_path}")
+    print(f"✅ Strategy factors saved to {simple_path}")
+    
+    # Print summary
+    print(f"\n📈 Factor Summary:")
+    print(f"   Total pairs: {enhanced_data['metadata']['total_pairs']}")
+    print(f"   Average factor: {enhanced_data['metadata']['avg_factor']:.3f}")
+    print(f"   Aggressive pairs (>1.2): {enhanced_data['metadata']['aggressive_pairs']}")
+    print(f"   Conservative pairs (<0.8): {enhanced_data['metadata']['conservative_pairs']}")
+    print(f"   Overall trend: {trends.get('overall', 'unknown')}")
 
-    # Prepare data
-    trades['close_date'] = pd.to_datetime(trades['close_date'])
-    trades = trades.sort_values('close_date')
-    trades['cumulative_profit'] = (1 + trades['profit_ratio']).cumprod() - 1
+def create_enhanced_telegram_report(factors, trends, metrics_comparison, mode):
+    """Create enhanced Telegram report with trend analysis"""
+    message = f"*🔄 Enhanced Risk Management Report*\n"
+    message += f"Mode: {mode} | {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
     
-    # 1. Cumulative profit over time
-    plt.figure(figsize=(12, 6))
-    plt.plot(trades['close_date'], trades['cumulative_profit'] * 100)
-    plt.title('Cumulative Profit Over Time (%)')
-    plt.xlabel('Date')
-    plt.ylabel('Cumulative Profit %')
-    plt.grid(True)
-    plt.savefig(os.path.join(output_dir, 'cumulative_profit.png'))
-    
-    # 2. Win rate by pair (top 10)
-    if not report['pair_metrics']:
-        return
-
-    pair_df = pd.DataFrame(report['pair_metrics'])
-    if len(pair_df) > 10:
-        pair_df = pair_df.nlargest(10, 'trade_count')
-    
-    plt.figure(figsize=(12, 6))
-    plt.bar(pair_df['pair'], pair_df['win_rate'] * 100)
-    plt.title('Win Rate by Pair (%)')
-    plt.xlabel('Pair')
-    plt.ylabel('Win Rate %')
-    plt.xticks(rotation=45)
-    plt.grid(True, axis='y')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'win_rate_by_pair.png'))
-    
-    # 3. Profit histogram
-    plt.figure(figsize=(12, 6))
-    plt.hist(trades['profit_ratio'] * 100, bins=30, alpha=0.7)
-    plt.title('Profit Distribution (%)')
-    plt.xlabel('Profit %')
-    plt.ylabel('Number of Trades')
-    plt.grid(True)
-    plt.savefig(os.path.join(output_dir, 'profit_histogram.png'))
-    
-    # 4. Recommended position sizing
-    if 'position_recommendations' in report and report['position_recommendations']:
-        pos_df = pd.DataFrame(report['position_recommendations'])
-        if len(pos_df) > 10:
-            pos_df = pos_df.nlargest(10, 'recommended_position')
+    if mode == 'adaptive' and 'monthly' in metrics_comparison:
+        monthly = metrics_comparison['monthly']
+        weekly = metrics_comparison['weekly']
         
-        plt.figure(figsize=(12, 6))
-        plt.bar(pos_df['pair'], pos_df['recommended_position'] * 100)
-        plt.title('Recommended Position Size by Pair (% of Portfolio)')
-        plt.xlabel('Pair')
-        plt.ylabel('Position Size %')
-        plt.xticks(rotation=45)
-        plt.grid(True, axis='y')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'position_sizing.png'))
-    
-    plt.close('all')
-
-def format_telegram_report(report):
-    """Format a concise version of the report for Telegram"""
-    metrics = report['overall_metrics']
-    
-    # Format overall metrics
-    message = f"*FreqTrade Risk Management Report*\n"
-    message += f"Date: {report['report_date']}\n\n"
-    
-    message += f"*Overall Performance*\n"
-    message += f"Total Trades: {metrics['total_trades']}\n"
-    message += f"Win Rate: {metrics['win_rate']:.2%}\n"
-    message += f"Profit Sum: {metrics['profit_sum']:.2%}\n"
-    message += f"Expectancy: {metrics['expectancy']:.4f}\n"
-    message += f"Profit Factor: {metrics['profit_factor']:.2f}\n"
-    message += f"Max Drawdown: {abs(metrics['max_drawdown']):.2%}\n\n"
-    
-    # Add top 3 and bottom 3 pairs
-    if report['pair_metrics']:
-        pair_df = pd.DataFrame(report['pair_metrics'])
+        message += f"*📊 30-Day Performance*\n"
+        message += f"Total Trades: {monthly['total_trades']}\n"
+        message += f"Win Rate: {monthly['win_rate']:.1%}\n"
+        message += f"Total Profit: {monthly['profit_sum']:.2%}\n"
+        message += f"Expectancy: {monthly['expectancy']:.4f}\n"
+        message += f"Sharpe Ratio: {monthly['sharpe_ratio']:.2f}\n\n"
         
-        message += "*Top 3 Pairs*\n"
-        top_pairs = pair_df.nlargest(3, 'expectancy')
-        for _, row in top_pairs.iterrows():
-            message += f"{row['pair']}: {row['avg_profit']:.2%} ({row['trade_count']} trades)\n"
+        # Trend analysis
+        if trends.get('overall') != 'insufficient_data':
+            message += f"*📈 Trend Analysis*\n"
+            message += f"Overall: {trends['overall'].replace('_', ' ').title()}\n"
+            message += f"Win Rate: {trends['win_rate'].title()}\n"
+            message += f"Profit: {trends['profit'].title()}\n"
+            message += f"Expectancy: {trends['expectancy'].title()}\n\n"
         
-        message += "\n*Bottom 3 Pairs*\n"
-        bottom_pairs = pair_df.nsmallest(3, 'expectancy')
-        for _, row in bottom_pairs.iterrows():
-            message += f"{row['pair']}: {row['avg_profit']:.2%} ({row['trade_count']} trades)\n"
+        # Week vs Month comparison
+        if weekly['total_trades'] > 0:
+            weekly_daily = weekly['profit_sum'] / 7
+            monthly_daily = monthly['profit_sum'] / 30
+            daily_change = (weekly_daily - monthly_daily) / monthly_daily if monthly_daily != 0 else 0
+            
+            message += f"*🔥 Recent vs Historical*\n"
+            message += f"7-day daily profit: {weekly_daily:.3%}\n"
+            message += f"30-day daily profit: {monthly_daily:.3%}\n"
+            message += f"Change: {daily_change:+.1%}\n\n"
     
-    # Add tag performance if available
-    if report['tag_metrics']:
-        tag_df = pd.DataFrame(report['tag_metrics'])
+    # Factor summary
+    if factors:
+        aggressive = [pair for pair, factor in factors.items() if factor > 1.2]
+        conservative = [pair for pair, factor in factors.items() if factor < 0.8]
         
-        message += "\n*Strategy Tags*\n"
-        for _, row in tag_df.iterrows():
-            message += f"{row['tag']}: {row['avg_profit']:.2%} win rate: {row['win_rate']:.2%}\n"
-    
-    # Add recent vs historical comparison
-    time_comp = report['time_comparison']
-    if time_comp.get('recent_week') and time_comp.get('historical'):
-        recent = time_comp['recent_week']
-        hist = time_comp['historical']
+        message += f"*⚖️ Position Sizing Updates*\n"
+        message += f"Total pairs: {len(factors)}\n"
+        message += f"Avg factor: {sum(factors.values())/len(factors):.3f}\n"
         
-        change = (recent['win_rate'] - hist['win_rate']) / hist['win_rate'] if hist['win_rate'] else float('inf')
+        if aggressive:
+            message += f"\n*🚀 Aggressive (>1.2):*\n"
+            for pair in aggressive[:5]:  # Top 5
+                message += f"{pair}: {factors[pair]:.3f}\n"
         
-        message += f"\n*Recent Performance (7d)*\n"
-        message += f"Win Rate: {recent['win_rate']:.2%} ({change:+.1%} vs historical)\n"
-    
-    message += f"\nDetailed report available in: risk_report_{report['report_date']}.json"
+        if conservative:
+            message += f"\n*🛡️ Conservative (<0.8):*\n"
+            for pair in conservative[:5]:  # Top 5
+                message += f"{pair}: {factors[pair]:.3f}\n"
     
     return message
 
 def main():
-    """Main execution flow"""
-    print(f"Starting risk analysis at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    """Main execution flow with enhanced functionality"""
+    parser = argparse.ArgumentParser(description='Enhanced FreqTrade Risk Management')
+    parser.add_argument('--mode', choices=['adaptive', 'traditional'], default='adaptive',
+                       help='Analysis mode: adaptive (30-day rolling) or traditional (all history)')
+    parser.add_argument('--days', type=int, default=30,
+                       help='Days to look back for adaptive mode')
+    parser.add_argument('--no-telegram', action='store_true',
+                       help='Skip Telegram notification')
     
-    # Get trades
-    trades = get_trades_from_db()
+    args = parser.parse_args()
     
-    if trades.empty:
-        print("No closed trades found in database")
-        return
+    print(f"🚀 Starting Enhanced Risk Management at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Mode: {args.mode}")
     
-    print(f"Analyzing {len(trades)} trades...")
-    
-    # Generate report
-    report, report_path = generate_risk_report(trades)
-    
-    # Create visualizations
-    create_visualizations(trades, report, OUTPUT_DIR)
-    
-    # Send summary to Telegram
-    telegram_message = format_telegram_report(report)
-    send_telegram_message(telegram_message)
-    
-    print(f"Risk analysis completed. Report saved to {report_path}")
-    print(f"Visualizations saved to {OUTPUT_DIR}")
+    try:
+        # Run enhanced workflow
+        factors, trends, metrics_comparison = enhanced_risk_management_workflow(args.mode)
+        
+        if not factors:
+            print("⚠️ No factors generated - insufficient trade data")
+            return
+        
+        # Create and send Telegram report
+        if not args.no_telegram:
+            telegram_message = create_enhanced_telegram_report(factors, trends, metrics_comparison, args.mode)
+            response = send_telegram_message(telegram_message)
+            if response:
+                print("✅ Telegram notification sent")
+            else:
+                print("⚠️ Failed to send Telegram notification")
+        
+        print(f"✅ Enhanced risk analysis completed successfully")
+        print(f"   Generated factors for {len(factors)} pairs")
+        
+        if args.mode == 'adaptive':
+            print(f"   Strategy trend: {trends.get('overall', 'unknown')}")
+            
+    except Exception as e:
+        error_msg = f"❌ Error in risk management: {str(e)}"
+        print(error_msg)
+        if not args.no_telegram:
+            send_telegram_message(f"*Risk Management Error*\n{error_msg}")
 
 if __name__ == "__main__":
     main()
