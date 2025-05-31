@@ -782,6 +782,7 @@ class Backtesting:
                 trade.close(order.ft_price, show_msg=False)
 
                 LocalTrade.close_bt_trade(trade)
+
             self.wallets.update()
             self.run_protections(pair, current_time, trade.trade_direction)
 

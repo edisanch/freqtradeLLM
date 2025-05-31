@@ -218,26 +218,42 @@ def analyze_by_pair(trades):
     if trades.empty:
         return pd.DataFrame()
         
-    pair_metrics = trades.groupby('pair').agg({
-        'profit_ratio': ['count', 'mean', 'sum', 'std'],
-        'trade_duration': 'mean'
-    }).reset_index()
-    
-    pair_metrics.columns = ['pair', 'trade_count', 'avg_profit', 'total_profit', 'profit_std', 'avg_duration']
-    
-    # Calculate win rate per pair
-    win_counts = trades[trades['profit_ratio'] > 0].groupby('pair').size()
-    pair_metrics['win_count'] = pair_metrics['pair'].map(win_counts).fillna(0).astype(int)
-    pair_metrics['win_rate'] = pair_metrics['win_count'] / pair_metrics['trade_count']
-    
-    # Calculate expectancy per pair
-    pair_metrics['expectancy'] = pair_metrics.apply(
-        lambda row: calculate_pair_expectancy(trades, row['pair']), 
-        axis=1
-    )
-    
-    return pair_metrics.sort_values('expectancy', ascending=False)
-
+    # Check if pair column exists
+    if 'pair' not in trades.columns:
+        print("Warning: 'pair' column not found in trades data")
+        print(f"Available columns: {list(trades.columns)}")
+        return pd.DataFrame()
+        
+    try:
+        # Group by pair and calculate metrics
+        pair_metrics = trades.groupby('pair').agg({
+            'profit_ratio': ['count', 'mean', 'sum', 'std'],
+            'trade_duration': 'mean'
+        })
+        
+        # Flatten the multi-level column index
+        pair_metrics.columns = ['trade_count', 'avg_profit', 'total_profit', 'profit_std', 'avg_duration']
+        pair_metrics = pair_metrics.reset_index()
+        
+        # Calculate win rate per pair
+        win_counts = trades[trades['profit_ratio'] > 0].groupby('pair').size()
+        pair_metrics['win_count'] = pair_metrics['pair'].map(win_counts).fillna(0).astype(int)
+        pair_metrics['win_rate'] = pair_metrics['win_count'] / pair_metrics['trade_count']
+        
+        # Calculate expectancy per pair
+        pair_metrics['expectancy'] = pair_metrics.apply(
+            lambda row: calculate_pair_expectancy(trades, row['pair']), 
+            axis=1
+        )
+        
+        return pair_metrics.sort_values('expectancy', ascending=False)
+        
+    except Exception as e:
+        print(f"Error in analyze_by_pair: {e}")
+        print(f"Trades shape: {trades.shape}")
+        print(f"Available columns: {list(trades.columns)}")
+        print(f"Sample data:\n{trades.head()}")
+        return pd.DataFrame()
 def calculate_pair_expectancy(trades, pair):
     """Calculate expectancy for a specific pair"""
     pair_trades = trades[trades['pair'] == pair]
@@ -377,54 +393,85 @@ def generate_adaptive_pair_factors(monthly_trades, min_trades_threshold=5):
     - Minimum trade threshold to avoid overfitting
     """
     
+    print("🔍 Generating adaptive pair factors...")
+    
+    # Debug: Check monthly trades
+    if monthly_trades.empty:
+        print("⚠️ No monthly trades data available")
+        return {}
+    
+    print(f"Monthly trades: {len(monthly_trades)} trades")
+    print(f"Available columns: {list(monthly_trades.columns)}")
+    
     # Get historical trades (31-90 days back for comparison)
     historical_trades = get_trades_between_dates(90, 31)
+    print(f"Historical trades: {len(historical_trades)} trades")
     
     # Calculate recent and historical performance
     recent_metrics = analyze_by_pair(monthly_trades)
     historical_metrics = analyze_by_pair(historical_trades)
     
+    print(f"Recent metrics: {len(recent_metrics)} pairs")
+    print(f"Historical metrics: {len(historical_metrics)} pairs")
+    
     # Combine with weighted average
     pair_factors = {}
     
-    # Get all unique pairs from both datasets
-    all_pairs = set()
-    if not recent_metrics.empty:
-        all_pairs.update(recent_metrics['pair'].unique())
-    if not historical_metrics.empty:
-        all_pairs.update(historical_metrics['pair'].unique())
+    # Get all unique pairs from monthly trades
+    if 'pair' in monthly_trades.columns:
+        all_pairs = set(monthly_trades['pair'].unique())
+        print(f"Found {len(all_pairs)} unique pairs: {list(all_pairs)[:10]}...")  # Show first 10
+    else:
+        print("❌ No 'pair' column found in monthly trades")
+        return {}
     
     for pair in all_pairs:
-        recent_data = recent_metrics[recent_metrics['pair'] == pair]
-        historical_data = historical_metrics[historical_metrics['pair'] == pair]
-        
-        has_recent = not recent_data.empty and recent_data.iloc[0]['trade_count'] >= min_trades_threshold
-        has_historical = not historical_data.empty and historical_data.iloc[0]['trade_count'] >= min_trades_threshold
-        
-        if has_recent and has_historical:
-            # Both available - use weighted combination
-            recent_factor = calculate_factor_from_metrics(recent_data.iloc[0])
-            historical_factor = calculate_factor_from_metrics(historical_data.iloc[0])
+        try:
+            # Find pair in recent metrics
+            recent_data = recent_metrics[recent_metrics['pair'] == pair] if not recent_metrics.empty else pd.DataFrame()
+            historical_data = historical_metrics[historical_metrics['pair'] == pair] if not historical_metrics.empty else pd.DataFrame()
             
-            # 70% recent, 30% historical
-            factor = (recent_factor * 0.7) + (historical_factor * 0.3)
+            has_recent = not recent_data.empty and recent_data.iloc[0]['trade_count'] >= min_trades_threshold
+            has_historical = not historical_data.empty and historical_data.iloc[0]['trade_count'] >= min_trades_threshold
             
-        elif has_recent:
-            # Only recent data available
-            factor = calculate_factor_from_metrics(recent_data.iloc[0])
+            if has_recent and has_historical:
+                # Both available - use weighted combination
+                recent_factor = calculate_factor_from_metrics(recent_data.iloc[0])
+                historical_factor = calculate_factor_from_metrics(historical_data.iloc[0])
+                
+                # 70% recent, 30% historical
+                factor = (recent_factor * 0.7) + (historical_factor * 0.3)
+                
+            elif has_recent:
+                # Only recent data available
+                factor = calculate_factor_from_metrics(recent_data.iloc[0])
+                
+            elif has_historical:
+                # Only historical data available
+                factor = calculate_factor_from_metrics(historical_data.iloc[0])
+                
+            else:
+                # Not enough data - calculate simple factor from raw trades
+                pair_trades = monthly_trades[monthly_trades['pair'] == pair]
+                if len(pair_trades) >= 3:  # Minimum 3 trades
+                    win_rate = (pair_trades['profit_ratio'] > 0).mean()
+                    avg_profit = pair_trades['profit_ratio'].mean()
+                    
+                    # Simple factor calculation
+                    factor = 1.0 + (avg_profit * 5) + ((win_rate - 0.5) * 0.5)
+                    factor = max(0.5, min(1.5, factor))  # Conservative bounds
+                else:
+                    factor = 1.0  # Neutral for very limited data
             
-        elif has_historical:
-            # Only historical data available
-            factor = calculate_factor_from_metrics(historical_data.iloc[0])
+            # Apply final bounds (0.3 to 2.0)
+            factor = max(0.3, min(2.0, factor))
+            pair_factors[pair] = factor
             
-        else:
-            # Not enough data for either - use neutral
-            factor = 1.0
-        
-        # Apply bounds (0.3 to 2.0)
-        factor = max(0.3, min(2.0, factor))
-        pair_factors[pair] = factor
+        except Exception as e:
+            print(f"⚠️ Error processing pair {pair}: {e}")
+            pair_factors[pair] = 1.0  # Safe default
     
+    print(f"✅ Generated factors for {len(pair_factors)} pairs")
     return pair_factors
 
 def enhanced_risk_management_workflow(mode='adaptive'):
@@ -628,4 +675,5 @@ def main():
             send_telegram_message(f"*Risk Management Error*\n{error_msg}")
 
 if __name__ == "__main__":
-    main()
+    main()  
+
